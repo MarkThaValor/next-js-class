@@ -1,0 +1,38 @@
+[
+    {
+        "id": 1,
+        "name": "Mark",
+        "messages": [
+            {
+                "id": 1,
+                "message": "hi",
+                "date": "2022-01-01",
+                "read": false
+            }
+        ]
+    },
+    {
+        "id": 2,
+        "name": "John",
+        "messages": [
+            {
+                "id": 1,
+                "message": "hi",
+                "date": "2022-01-01",
+                "read": false
+            }
+        ]
+    },
+    {
+        "id": 3,
+        "name": "Samuel",
+        "messages": [
+            {
+                "id": 1,
+                "message": "hi",
+                "date": "2022-01-01",
+                "read": false
+            }
+        ]
+    }
+]

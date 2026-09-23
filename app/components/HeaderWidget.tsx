@@ -1,16 +1,21 @@
 'use client';
 import { useState } from "react";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { Menu, X, ChevronDown, ArrowUpRight } from "lucide-react";
 
 export default function HeaderWidget() {
   const [open, setOpen] = useState(false);
 
-  return (
+  const pathname = usePathname()
+
+  const headerNav = (pathname ===  "/resources") ? " " :
+
     <header className="sticky top-0 z-50 w-full border-b border-black/5 bg-white/80 backdrop-blur-xl">
       <div className="mx-auto flex h-20 max-w-7xl items-center justify-between px-6 lg:px-8">
 
         {/* Logo */}
-        <a href="/" className="flex items-center gap-3">
+        <Link href="/" className="flex items-center gap-3">
           <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-black text-white font-bold">
             A
           </div>
@@ -18,35 +23,35 @@ export default function HeaderWidget() {
           <span className="text-lg font-semibold tracking-tight">
             Akauntbook
           </span>
-        </a>
+        </Link>
 
         {/* Desktop Navigation */}
         <nav className="hidden items-center gap-8 md:flex">
-          <a
-            href="#product"
+          <Link
+            href="/about"
             className="text-sm font-medium text-gray-600 transition hover:text-black"
           >
-            Product
-          </a>
+            About
+          </Link>
 
-          <a
-            href="#solutions"
+          <Link
+            href="/about/mark"
             className="text-sm font-medium text-gray-600 transition hover:text-black"
           >
-            Solutions
-          </a>
+            About Mark
+          </Link>
 
-          <a
-            href="#pricing"
+          <Link
+            href="/pricing"
             className="text-sm font-medium text-gray-600 transition hover:text-black"
           >
             Pricing
-          </a>
+          </Link>
 
-          <button className="flex items-center gap-1 text-sm font-medium text-gray-600 hover:text-black">
+          <Link href="/resources" className="flex items-center gap-1 text-sm font-medium text-gray-600 hover:text-black">
             Resources
             <ChevronDown size={15} />
-          </button>
+          </Link>
         </nav>
 
         {/* Actions */}
@@ -101,6 +106,11 @@ export default function HeaderWidget() {
           </nav>
         </div>
       )}
-    </header>
-  );
+    </header>;
+
+    return headerNav;
+
+
+    
+  
 }

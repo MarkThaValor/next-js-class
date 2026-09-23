@@ -1,0 +1,253 @@
+# Implementation Plan: True Offline-First Business Operation in Akauntme
+
+## 1. Overview & Core Principle
+
+> **"NEPA can take the light. MTN can go down. Your business does not stop."**
+
+This plan transitions Akauntme from a network-dependent web app into a **true offline-first business application**. Local IndexedDB becomes the primary operational data layer for all business operations (sales, expenses, products, stock adjustments, invoices, clients, settings). Connectivity is treated solely as a synchronization channel, not a requirement for business continuity.
+
+When offline, operations complete in milliseconds locally, stock decreases immediately on sales, mutations are saved to a durable transaction queue, and automatic retry-safe synchronization reconciles with the backend when connection is restored.
+
+---
+
+## 2. User Review Required
+
+> [!IMPORTANT]
+> **Database Schema Migration**: A migration `add_idempotency_key_to_business_tables` will be run on the Laravel backend to add an indexed, nullable `idempotency_key` column to `sales`, `transactions`, `products`, and `customers`. This enables 100% duplicate-safe, retry-safe offline syncing.
+
+> [!IMPORTANT]
+> **Primary Data Layer Inversion**: The frontend store (`useAppStore`) and React Query hooks (`useTransactions`, `useProducts`, `useInvoices`, `useClients`) will now read from local IndexedDB (`dbService`) on app startup and queries. Backend calls will run in the background to sync and reconcile, meaning the application will boot and function instantly with 0 ms wait time even when completely disconnected.
+
+> [!NOTE]
+> **Removal of False Offline Behaviors**:
+> - The aggressive 5-second polling loop in `ConnectivityProvider` will be removed.
+> - Blocking popups (`ServerOfflineModal`, `ServerOfflineCard`) will be removed from standard workflow.
+> - Error messages such as "Network error. Try again" will be replaced by subtle, non-intrusive feedback: *"Saved locally. Will sync when you're back online."*
+
+---
+
+## 3. Architecture & Data Flow
+
+```text
+User Actions (Sale, Expense, Product, Client, Invoice)
+                   │
+                   ▼
+┌─────────────────────────────────────────────────────────┐
+│              Local Data Layer (IndexedDB)               │
+│                                                         │
+│  1. Save record with client-generated UUID              │
+│  2. If Sale: Decrement local product stock immediately  │
+│  3. Add mutation to durable 'sync_queue'                │
+│  4. Update in-memory Zustand Store & React Query Cache  │
+└─────────────────────────────────────────────────────────┘
+                   │
+                   ▼
+         Immediate UI Feedback
+  (Stock updated, sale visible, receipt ready,
+   subtle "Saved locally. Will sync online")
+                   │
+      ┌────────────┴────────────┐
+      ▼                         ▼
+  [OFFLINE]                  [ONLINE]
+User continues            SyncEngine triggers
+business smoothly         background sync
+                                │
+                                ▼
+               ┌─────────────────────────────────┐
+               │    Backend Synchronization      │
+               │       (POST /api/v1/sync        │
+               │   or Idempotent REST Fallback)  │
+               │                                 │
+               │  - Resolves temp client/product │
+               │    IDs topologically            │
+               │  - Prevents duplicate entries   │
+               │    via Idempotency Keys         │
+               │  - Authoritatively adjusts      │
+               │    server inventory & finances  │
+               └─────────────────────────────────┘
+                                │
+                                ▼
+               ┌─────────────────────────────────┐
+               │      Local Reconciliation       │
+               │                                 │
+               │  - Reconcile local IDs & stamps │
+               │  - Remove item from sync queue  │
+               │  - UI badge reflects "Synced"   │
+               └─────────────────────────────────┘
+```
+
+---
+
+## 4. Proposed Changes
+
+### Layer 1: Persistent Local Storage (`akauntme-frontend-2026/app/lib/db.ts`)
+
+#### [MODIFY] [db.ts](file:///c:/Users/MarkThaValor/Documents/Akauntme/akauntme-frontend-2026/app/lib/db.ts)
+- Upgrade database version to `7`.
+- Add `sync_queue` store with key `id` and indexes on `status`, `createdAt`, `entityType`, and `idempotencyKey`.
+- Enhance `AkauntmeDB` interface:
+  ```typescript
+  export interface SyncQueueItem {
+      id: string; // Queue ID
+      idempotencyKey: string;
+      entityType: 'transaction' | 'client' | 'invoice' | 'product';
+      action: 'create' | 'update' | 'delete';
+      localId: string;
+      data: any;
+      createdAt: string;
+      status: 'pending' | 'syncing' | 'failed' | 'completed';
+      retryCount: number;
+      lastError?: string | null;
+  }
+  ```
+- Implement atomic stock mutation helper:
+  - `decrementProductStock(productId: string, quantity: number): Promise<Product | null>`
+    Directly decreases the quantity of the product in IndexedDB and updates `updatedAt`.
+  - `incrementProductStock(productId: string, quantity: number): Promise<Product | null>`
+- Implement Queue helpers:
+  - `addToSyncQueue(item: Omit<SyncQueueItem, 'id' | 'createdAt' | 'status' | 'retryCount'>): Promise<SyncQueueItem>`
+  - `getPendingSyncQueue(): Promise<SyncQueueItem[]>`
+  - `updateSyncQueueItem(id: string, updates: Partial<SyncQueueItem>): Promise<void>`
+  - `removeSyncQueueItem(id: string): Promise<void>`
+- Implement dynamic user isolation:
+  - Connect to `AkauntmeDB_${userId}` when user ID is known, preventing multi-tenant data bleed on shared devices.
+
+---
+
+### Layer 2: Local-First Store & Mutations (`akauntme-frontend-2026/app/store/useAppStore.ts`)
+
+#### [MODIFY] [useAppStore.ts](file:///c:/Users/MarkThaValor/Documents/Akauntme/akauntme-frontend-2026/app/store/useAppStore.ts)
+- **Instant Boot (`init`)**:
+  - Load cached `profile` from IndexedDB (`dbService.getProfile()`) or `localStorage.getItem('auth_user_shell')`.
+  - Load `products`, `transactions`, `invoices`, `clients` directly from `dbService` into Zustand state.
+  - Set `initialized: true`, `loading: false` immediately.
+  - If online, trigger background API refresh and merge into `dbService` without overwriting pending mutations.
+- **Local-First Mutations**:
+  - `addTransaction`:
+    1. Generate client UUID and `idempotencyKey = crypto.randomUUID()`.
+    2. Save to `dbService.addTransaction(...)` with `syncStatus: 'pending_create'`.
+    3. Add operation to `dbService.addToSyncQueue(...)`.
+    4. Update in-memory `transactions` array.
+    5. Trigger `syncEngine.sync()` in background.
+  - `addInvoice`:
+    1. Generate client UUID and `idempotencyKey`.
+    2. Save to `dbService.addInvoice(...)` with `syncStatus: 'pending_create'`.
+    3. **Inventory update**: For every invoice item with a `productId`, call `dbService.decrementProductStock(productId, item.quantity)` and immediately update `products` in Zustand store so stock drops in the UI instantly!
+    4. Add operation to `sync_queue`.
+    5. Trigger `syncEngine.sync()` in background.
+  - `addProduct`:
+    1. Generate client UUID and `idempotencyKey`.
+    2. Save to `dbService.addProduct(...)` with `syncStatus: 'pending_create'`.
+    3. Add to `sync_queue`.
+    4. Update store and trigger `syncEngine.sync()`.
+  - `updateProduct`, `deleteProduct`, `addClient`, `updateClient`, `deleteClient`:
+    - Apply the same pattern (immediate IndexedDB write, queue insertion, local UI update, background sync trigger).
+
+---
+
+### Layer 3: React Query Cache Resilience (`akauntme-frontend-2026/app/hooks/`)
+
+#### [MODIFY] [useData.ts](file:///c:/Users/MarkThaValor/Documents/Akauntme/akauntme-frontend-2026/app/hooks/useData.ts)
+- Update `useProducts`, `useInvoices`, `useClients`:
+  - `queryFn`: Read from `dbService` first. If online, fetch from API in background, persist new records into `dbService`, and return merged data. If offline or network error occurs, seamlessly return `dbService` cached data without setting error states or blocking the UI.
+
+#### [MODIFY] [useTransactions.ts](file:///c:/Users/MarkThaValor/Documents/Akauntme/akauntme-frontend-2026/app/hooks/useTransactions.ts)
+- Read from `dbService.getTransactions()` with date filters applied locally. If online, fetch from API, persist to IndexedDB, and return latest.
+
+---
+
+### Layer 4: Backend Idempotency & Batch Sync (`akauntme-backend-2026`)
+
+#### [NEW] Migration: `database/migrations/2026_09_12_000000_add_idempotency_key_to_business_tables.php`
+- Add nullable, indexed `idempotency_key` column to:
+  - `sales`
+  - `transactions`
+  - `products`
+  - `customers`
+
+#### [MODIFY] [SalesController.php](file:///c:/xampp/htdocs/laravel/akauntme-backend-2026/app/Http/Controllers/API/V1/SalesController.php)
+- Accept `idempotency_key` (or `X-Idempotency-Key` header).
+- If a sale with `business_id` and matching `idempotency_key` already exists, return the existing sale with `200 OK` without creating a duplicate record or decrementing stock again.
+- Store `idempotency_key` on creation.
+
+#### [MODIFY] [TransactionController.php](file:///c:/xampp/htdocs/laravel/akauntme-backend-2026/app/Http/Controllers/API/V1/TransactionController.php)
+- Accept `idempotency_key`. If matching `user_id` and `idempotency_key` exists, return existing transaction with `200 OK` without modifying account balances twice.
+
+#### [MODIFY] [ProductController.php](file:///c:/xampp/htdocs/laravel/akauntme-backend-2026/app/Http/Controllers/API/V1/ProductController.php)
+- Accept `idempotency_key`. Avoid duplicate product creation.
+
+#### [MODIFY] [CustomerController.php](file:///c:/xampp/htdocs/laravel/akauntme-backend-2026/app/Http/Controllers/API/V1/CustomerController.php)
+- Accept `idempotency_key`. Avoid duplicate customer creation.
+
+#### [NEW] [SyncController.php](file:///c:/xampp/htdocs/laravel/akauntme-backend-2026/app/Http/Controllers/API/V1/SyncController.php) & Route in `routes/api.php`
+- Endpoint `POST /api/v1/sync`:
+  - Receives a batch of operations: `{ operations: [...] }`.
+  - Process order:
+    1. Customers (clients)
+    2. Products
+    3. Invoices / Sales (resolves temporary client IDs or product IDs using mapping from steps 1 & 2)
+    4. Transactions / Expenses (resolves temporary client IDs or invoice IDs)
+  - Returns mapping of `{ local_id, server_id, status, entity }` for atomic frontend reconciliation.
+
+---
+
+### Layer 5: Robust Sync Engine (`akauntme-frontend-2026/app/lib/SyncEngine.ts`)
+
+#### [MODIFY] [SyncEngine.ts](file:///c:/Users/MarkThaValor/Documents/Akauntme/akauntme-frontend-2026/app/lib/SyncEngine.ts)
+- Replace legacy one-by-one uncoordinated sync with a resilient queue processor:
+  - Tracks sync status: `'synced' | 'syncing' | 'pending' | 'offline' | 'error'`.
+  - Tracks `pendingCount`.
+  - Handles reconnection gracefully when `online` event fires.
+  - Sends batches to `/api/v1/sync` (falling back to individual idempotent endpoints if needed).
+  - Updates local IndexedDB entities with authoritative server IDs, timestamps, and marks them `synced`.
+  - Removes completed operations from `sync_queue`.
+  - Reconciles inventory: updates product stock to match authoritative server response.
+  - Exposes reactive event hooks for UI components.
+
+---
+
+### Layer 6: Offline UI & Reconnection Experience
+
+#### [MODIFY] [ConnectivityProvider.tsx](file:///c:/Users/MarkThaValor/Documents/Akauntme/akauntme-frontend-2026/app/providers/ConnectivityProvider.tsx)
+- Remove aggressive 5-second polling loop.
+- Use passive event-based connectivity (`online` / `offline` / API response interceptors) with a single heartbeat only when needed.
+
+#### [NEW] [SyncStatusBadge.tsx](file:///c:/Users/MarkThaValor/Documents/Akauntme/akauntme-frontend-2026/app/components/ui/SyncStatusBadge.tsx)
+- Sleek, unobtrusive status pill:
+  - **Synced**: Subtle small green dot / checkmark (collapses gracefully).
+  - **Syncing**: Subtle spinning icon with count (`Syncing 2 items...`).
+  - **Offline / Pending**: Amber badge (`Offline • 3 saved locally`).
+  - **Error**: Subtle warning with retry button on tap.
+
+#### [MODIFY] [AppSidebar.tsx](file:///c:/Users/MarkThaValor/Documents/Akauntme/akauntme-frontend-2026/app/components/ui/AppSidebar.tsx) & [MobileHeader.tsx](file:///c:/Users/MarkThaValor/Documents/Akauntme/akauntme-frontend-2026/app/components/ui/MobileHeader.tsx)
+- Mount `SyncStatusBadge` in desktop sidebar and mobile header.
+
+#### [MODIFY] [AddTransaction.tsx](file:///c:/Users/MarkThaValor/Documents/Akauntme/akauntme-frontend-2026/app/pageComponents/AddTransaction.tsx) & [AddTransactionContent.tsx](file:///c:/Users/MarkThaValor/Documents/Akauntme/akauntme-frontend-2026/app/app/add/AddTransactionContent.tsx)
+- Update success notification to communicate sync status accurately:
+  - If online: *"Sale saved successfully"*
+  - If offline: *"Sale saved locally. Will sync when you're back online."*
+
+#### [MODIFY] [app/layout.tsx](file:///c:/Users/MarkThaValor/Documents/Akauntme/akauntme-frontend-2026/app/app/layout.tsx)
+- Ensure offline startup does not trigger redirect to `/login` when `auth_user_shell` exists in local storage.
+
+---
+
+## 5. Verification Plan
+
+### Automated Tests
+1. **Laravel Migrations & Tests**:
+   - Run `php artisan migrate` to verify the new `idempotency_key` migration.
+   - Run existing and new test cases verifying idempotent creation of sales, transactions, products, and customers.
+2. **Frontend Type-Check & Build**:
+   - Run `npm run lint` or Next.js build validation to verify TypeScript correctness.
+
+### Manual Verification Matrix (Scenarios from Requirements)
+- **Scenario A (Online)**: Create sale online -> verify saved locally in IndexedDB and sent to backend immediately -> marked synced.
+- **Scenario B (Offline Persistence)**: Disconnect internet (DevTools Network: Offline) -> record a sale and an expense -> close browser tab -> reopen app -> verify records and updated stock remain intact in dashboard and lists.
+- **Scenario C (Offline Batch Sync)**: Disconnect internet -> create 5 sales -> reconnect internet -> verify all 5 synchronize exactly once with no duplicates.
+- **Scenario D (Network Interruption During Sync)**: Trigger sync and simulate network failure midway -> reconnect -> verify sync resumes and already processed items are recognized idempotently without duplicate rows.
+- **Scenario E (Product Price Update Offline)**: Change product price offline -> reconnect -> verify backend receives correct updated price.
+- **Scenario F (Inventory Immediate Decrement & Reconciliation)**: Product has 10 units in stock -> record offline sale of 3 units -> verify stock drops to 7 immediately on screen -> reconnect -> verify server database stock drops to 7.
+- **Scenario G (Queue Ordering)**: Create a customer offline -> immediately create a sale for that customer offline -> reconnect -> verify customer is created first on backend, and sale links to that customer seamlessly.
+- **Scenario H (Crash / Restart Intact)**: Queue 3 operations -> reload page -> verify queue survives and begins syncing upon connectivity.
+- **Scenario I (Intermittent Connection)**: Set DevTools throttling to Slow 3G / intermittent -> perform operations -> verify UI never blocks with spinner modals or "Network error" alerts.
